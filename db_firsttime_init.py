@@ -9,8 +9,6 @@ path_to_data = "data/dense_rag_memories.txt"
 
 def init(text_data: str):
     # mode="overwrite" drops any existing "documents" table first.
-    # (db.db.drop_database() is a NO-OP on lancedb >= 0.17 — it warns and does
-    # nothing, which corrupts the table on rebuild.)
     db.table = db.db.create_table("documents", schema=db.Messages, mode="overwrite")
     return db.vectorization(db.chunk(text_data), init=True)
 
