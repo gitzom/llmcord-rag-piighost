@@ -1,13 +1,41 @@
-# This gitignore is a whitelist. Inspired by https://rgbcu.be/blog/gitignore
+# Whitelist gitignore: ignore EVERYTHING by default, then un-ignore what belongs
+# in the repo. Inspired by https://rgbcu.be/blog/gitignore
+
 
 *
 
+# --- core bot ---
 !.gitignore
-
-!*.md
 !*.py
-
-!Dockerfile
 !config.yaml
-!docker-compose.yaml
+!compose.yaml
+!*.toml
 !requirements.txt
+!.env.example
+!README.md
+!LICENSE.md
+
+# --- data/ ships only its README ---
+!data/
+!data/README.md
+
+# --- never publish: secrets & personal data (already covered by *, listed for clarity) ---
+.env
+keyshield
+logs/
+lancedb/
+data/dense_rag_memories.txt
+.commandcode/
+
+# ---dev scratch---
+
+basic_openai_test.py
+dbtest.py
+piighosttest.py
+test_anon.py
+test_openaipiighost.py
+test.ps1
+test_compose.yml
+start-piighost.ps1
+Dockerfile
+

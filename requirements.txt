@@ -3,3 +3,7 @@ httpx
 openai
 python-dotenv
 pyyaml
+
+
+lancedb
+sentence-transformers

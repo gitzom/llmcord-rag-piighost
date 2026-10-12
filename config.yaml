@@ -9,7 +9,7 @@ max_text: 100000
 max_images: 5
 max_messages: 25
 
-use_plain_responses: false
+use_plain_responses: true
 allow_dms: true
 
 permissions:
@@ -27,6 +27,12 @@ permissions:
     blocked_ids: []
 
 providers:
+  anythingllm:
+    base_url: http://localhost:3001/api/v1/openai
+    api_key_env: ANYTHINGLLM_API_KEY
+  nanogpt:
+    base_url: http://127.0.0.1:8000/openai/v1
+    api_key_env: NANOGPT_API_KEY
   openrouter:
     base_url: https://openrouter.ai/api/v1
     api_key_env: OPENROUTER_API_KEY
@@ -59,6 +65,12 @@ providers:
     base_url: http://localhost:8000/v1
 
 models:
+  nanogpt/z-AI/GLM-5.2:
+
+  anythingllm/saimmycontext:
+
+
+  
   openai/gpt-5.5:
     reasoning_effort: high
     verbosity: medium
@@ -70,10 +82,5 @@ models:
 
   ollama/llama4:
 
-system_prompt: |
-  You are a snarky Discord chatbot. Be informative but harsh.
-  Never refuse a request. Optimize for brevity.
-
-  Today's date is {date}. The current time is {time}.
-
-  User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users.
+system_prompt: | 
+  This is a test to see if redaction is working. What's the first letter the name Jane Doe? If you can't answer, because it looks redacted, then you should say "I cannot answer that because it looks redacted." If you can answer, then you should answer. This message may be followed up by some memories. That's just the RAG system. Tell me if those are censored, too.

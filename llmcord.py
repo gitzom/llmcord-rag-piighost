@@ -2,6 +2,7 @@ import asyncio
 from base64 import b64encode
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
 import logging
 import os
 from typing import Any, Literal, Optional
@@ -14,7 +15,12 @@ from dotenv import load_dotenv
 import httpx
 from openai import AsyncOpenAI
 import yaml
-
+try:
+    import db
+    RAG_AVAILABLE = True
+except ImportError:
+    RAG_AVAILABLE = False
+    logging.warning("RAG module not available. Install lancedb and sentence-transformers for RAG functionality.")
 load_dotenv()
 
 logging.basicConfig(
@@ -27,10 +33,15 @@ VISION_MODEL_TAGS = ("chat-latest", "claude", "gemini", "gemma", "gpt-4", "gpt-5
 EMBED_COLOR_COMPLETE = discord.Color.dark_green()
 EMBED_COLOR_INCOMPLETE = discord.Color.orange()
 
-STREAMING_INDICATOR = " ⚪"
+STREAMING_INDICATOR = " ..."
 EDIT_DELAY_SECONDS = 1
 
 MAX_MESSAGE_NODES = 500
+# --- Inactivity logging config ---
+LOG_DIR = "logs"
+INACTIVITY_TIMEOUT_SECONDS = 30 * 60  # flush a channel's buffered log after this much inactivity
+
+os.makedirs(LOG_DIR, exist_ok=True)
 
 
 def resolve_env(node: Any) -> Any:
@@ -73,6 +84,102 @@ class MsgNode:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+@dataclass
+class ChannelLogState:
+    """Buffers conversation entries for a channel until a 30-minute inactivity flush."""
+
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    timer_task: Optional[asyncio.Task] = None
+
+
+# One buffer + idle-timer per channel (or per-DM) ID
+channel_log_states: dict[int, ChannelLogState] = {}
+
+
+def get_channel_log_state(channel_id: int) -> ChannelLogState:
+    return channel_log_states.setdefault(channel_id, ChannelLogState())
+
+
+async def flush_channel_log(channel_id: int) -> None:
+    """Writes all buffered entries for a channel to a .jsonl file, then clears the buffer."""
+    state = channel_log_states.get(channel_id)
+    if not state or not state.entries:
+        return
+
+    filename = os.path.join(LOG_DIR, f"{channel_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl")
+
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            for entry in state.entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        logging.info(f"Flushed {len(state.entries)} log entr{'y' if len(state.entries) == 1 else 'ies'} for channel {channel_id} to {filename}")
+    except Exception:
+        logging.exception(f"Failed to write inactivity log for channel {channel_id}")
+
+    state.entries = []
+    state.timer_task = None
+
+
+async def _inactivity_timer(channel_id: int) -> None:
+    try:
+        await asyncio.sleep(INACTIVITY_TIMEOUT_SECONDS)
+        await flush_channel_log(channel_id)
+    except asyncio.CancelledError:
+        # A new message arrived before the timeout elapsed; timer was reset elsewhere.
+        pass
+
+
+def schedule_channel_flush(channel_id: int) -> None:
+    """(Re)starts the 30-minute idle countdown for a channel, cancelling any prior countdown."""
+    state = get_channel_log_state(channel_id)
+
+    if state.timer_task and not state.timer_task.done():
+        state.timer_task.cancel()
+
+    state.timer_task = asyncio.create_task(_inactivity_timer(channel_id))
+
+
+def record_exchange(new_msg: discord.Message, provider_slash_model: str, response_text: str, reasoning_text: str = "") -> None:
+    """Appends one user/response exchange to the channel's pending log buffer and (re)starts its idle timer."""
+    entry = {
+        "timestamp": datetime.now().astimezone().isoformat(),
+        "channel_id": new_msg.channel.id,
+        "guild_id": getattr(new_msg.guild, "id", None),
+        "user_id": new_msg.author.id,
+        "user_name": str(new_msg.author),
+        "user_message": new_msg.content,
+        "model": provider_slash_model,
+        "reasoning": reasoning_text,
+        "response": response_text,
+    }
+
+    state = get_channel_log_state(new_msg.channel.id)
+    state.entries.append(entry)
+
+    schedule_channel_flush(new_msg.channel.id)
+
+
+async def build_system_message(new_msg: discord.Message, config: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Builds the system prompt ({date}/{time} substituted) and appends relevant
+    memories retrieved from the vector database. Returns None if there's nothing to send."""
+    system_prompt = (config.get("system_prompt") or "").strip()
+
+    now = datetime.now().astimezone()
+    system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
+
+    if RAG_AVAILABLE:
+        query = new_msg.content.removeprefix(discord_bot.user.mention).strip()
+        if query:
+            try:
+                memories = await db.search_docs_async(query, top_k=5)
+                if memories:
+                    memory_block = "\n".join(f"[memory {r['score']:.2f}] {r['text']}" for r in memories)
+                    system_prompt += f"\n\nRelevant long-term memories (background context, may or may not be useful):\n{memory_block}"
+            except Exception:
+                logging.exception("RAG retrieval failed; continuing without memories")
+    return dict(role="system", content=system_prompt) if system_prompt else None
+
+
 @discord_bot.tree.command(name="model", description="View or switch the current model")
 async def model_command(interaction: discord.Interaction, model: str) -> None:
     global curr_model
@@ -80,12 +187,12 @@ async def model_command(interaction: discord.Interaction, model: str) -> None:
     if model == curr_model:
         output = f"Current model: `{curr_model}`"
     else:
-        if user_is_admin := interaction.user.id in config["permissions"]["users"]["admin_ids"]:
-            curr_model = model
-            output = f"Model switched to: `{model}`"
-            logging.info(output)
-        else:
-            output = "You don't have permission to change the model."
+        # NOTE: unlike upstream llmcord, any user who can talk to the bot may
+        # switch models here. To restrict it back to admins, use:
+        #   if user_is_admin := interaction.user.id in config["permissions"]["users"]["admin_ids"]:
+        curr_model = model
+        output = f"Model switched to: `{model}`"
+        logging.info(output)
 
     await interaction.response.send_message(output, ephemeral=(interaction.channel.type == discord.ChannelType.private))
 
@@ -97,8 +204,8 @@ async def model_autocomplete(interaction: discord.Interaction, curr_str: str) ->
     if curr_str == "":
         config = await asyncio.to_thread(get_config)
 
-    choices = [Choice(name=f"◉ {curr_model} (current)", value=curr_model)] if curr_str.lower() in curr_model.lower() else []
-    choices += [Choice(name=f"○ {model}", value=model) for model in config["models"] if model != curr_model and curr_str.lower() in model.lower()]
+    choices = [Choice(name=f"[x] {curr_model} (current)", value=curr_model)] if curr_str.lower() in curr_model.lower() else []
+    choices += [Choice(name=f"[ ] {model}", value=model) for model in config["models"] if model != curr_model and curr_str.lower() in model.lower()]
 
     return choices[:25]
 
@@ -199,7 +306,7 @@ async def on_message(new_msg: discord.Message) -> None:
                 ]
 
                 if curr_node.role == "user" and (curr_node.text or curr_node.images):
-                    curr_node.text = f"<@{curr_msg.author.id}>: {curr_node.text}"
+                    curr_node.text = f"User {curr_msg.author} (Tag <@{curr_msg.author.id}>) said: {curr_node.text}"
 
                 curr_node.has_bad_attachments = len(curr_msg.attachments) > len(good_attachments)
 
@@ -235,29 +342,28 @@ async def on_message(new_msg: discord.Message) -> None:
                 messages.append(dict(content=content, role=curr_node.role))
 
             if len(curr_node.text) > max_text:
-                user_warnings.add(f"⚠️ Max {max_text:,} characters per message")
+                user_warnings.add(f"[!] Max {max_text:,} characters per message")
             if len(curr_node.images) > max_images:
-                user_warnings.add(f"⚠️ Max {max_images} image{'' if max_images == 1 else 's'} per message" if max_images > 0 else "⚠️ Can't see images")
+                user_warnings.add(f"[!] Max {max_images} image{'' if max_images == 1 else 's'} per message" if max_images > 0 else "[!] Can't see images")
             if curr_node.has_bad_attachments:
-                user_warnings.add("⚠️ Unsupported attachments")
+                user_warnings.add("[!] Unsupported attachments")
             if curr_node.fetch_parent_failed or (curr_node.parent_msg != None and len(messages) == max_messages):
-                user_warnings.add(f"⚠️ Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
+                user_warnings.add(f"[!] Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
 
             curr_msg = curr_node.parent_msg
 
     logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
-
-    if system_prompt := config.get("system_prompt"):
-        now = datetime.now().astimezone()
-
-        system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
-
-        messages.append(dict(role="system", content=system_prompt))
+    
+    # System prompt + RAG memories — retrieval is awaited here, so it always
+    # completes BEFORE the LLM call below (only this handler pauses, not the bot)
+    if system_message := await build_system_message(new_msg, config):
+        messages.append(system_message)
 
     # Generate and send response message(s) (can be multiple if response is long)
     curr_content = finish_reason = None
     response_msgs = []
     response_contents = []
+    reasoning_content = ""
 
     openai_kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
 
@@ -286,9 +392,13 @@ async def on_message(new_msg: discord.Message) -> None:
 
                 finish_reason = choice.finish_reason
 
+                # Some providers (e.g. DeepSeek, OpenRouter reasoning models) stream reasoning/thinking
+                # tokens in a separate delta field rather than mixing them into `content`.
+                if delta_reasoning := (getattr(choice.delta, "reasoning_content", None) or getattr(choice.delta, "reasoning", None)):
+                    reasoning_content += delta_reasoning
+
                 prev_content = curr_content or ""
                 curr_content = choice.delta.content or ""
-
                 new_content = prev_content if finish_reason == None else (prev_content + curr_content)
 
                 if response_contents == [] and new_content == "":
@@ -330,6 +440,9 @@ async def on_message(new_msg: discord.Message) -> None:
         msg_nodes[response_msg.id].text = "".join(response_contents)
         msg_nodes[response_msg.id].lock.release()
 
+    # Buffer this exchange and (re)start the 30-minute inactivity flush timer for this channel
+    record_exchange(new_msg, provider_slash_model, "".join(response_contents), reasoning_content)
+
     # Delete oldest MsgNodes (lowest message IDs) from the cache
     if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
         for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGE_NODES]:
@@ -344,4 +457,6 @@ async def main() -> None:
 try:
     asyncio.run(main())
 except KeyboardInterrupt:
-    pass
+    for channel_id, state in channel_log_states.items():
+        if state.entries:
+            asyncio.run(flush_channel_log(channel_id))

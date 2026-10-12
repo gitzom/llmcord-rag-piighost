@@ -1,0 +1,68 @@
+# pipeline.toml, the server's default piighost configuration with one change being a custom model.
+
+name = "piighost-api-default"
+
+[detector]
+type = "composite"
+
+[[detector.detectors]]
+type = "llm"
+model = "gabriellarson/Anonymizer-0.6B-GGUF"
+labels = ["PERSON", "EMAIL", "PHONE", "ID", "SECRET", "CREDIT_CARD", "DATE", "LOCATION", "ORGANIZATION", "URL", "IP"]
+#model_provider = "huggingface"
+#max_chars = 2000
+
+[[detector.detectors]]
+type = "regex"
+catalogs = [
+    "catalog:piighost/logs:b635d867",
+    "catalog:piighost/identity-documents:08c163eb",
+    "catalog:piighost/business:8be59133",
+    "catalog:piighost/health:da8fa4c6",
+    "catalog:piighost/us-extended:b82939c9",
+    "catalog:piighost/us-health:596ed9cd",
+    "catalog:piighost/fr-extended:0af72c1b",
+    "catalog:piighost/be:bb239203",
+    "catalog:piighost/ch:4aa0f6aa",
+    "catalog:piighost/de:74eb9f4c",
+    "catalog:piighost/at:29bc939d",
+    "catalog:piighost/it:6af7753b",
+    "catalog:piighost/es:3980052d",
+    "catalog:piighost/pt:bd45b050",
+    "catalog:piighost/nl:3a7cf0f0",
+    "catalog:piighost/ie:f01a1f54",
+    "catalog:piighost/dk:6ac36560",
+    "catalog:piighost/se:990ac59e",
+    "catalog:piighost/fi:47437c04",
+    "catalog:piighost/pl:14c2e033",
+    "catalog:piighost/uk:7d4e3595",
+    "catalog:piighost/ca:5330fd7a",
+    "catalog:piighost/mx:aeb1db74",
+    "catalog:piighost/br:b48c945f",
+    "catalog:piighost/ar:c9a7281a",
+    "catalog:piighost/cl:2b58b122",
+    "catalog:piighost/au:193c78b4",
+    "catalog:piighost/in:ac86dc1b",
+    "catalog:piighost/id:055741a8",
+    "catalog:piighost/jp:8bba9c31",
+    "catalog:piighost/kr:2ee42d25",
+    "catalog:piighost/sg:12c80121",
+    "catalog:piighost/payment:b1b1cd64",
+    "catalog:piighost/crypto:8a80c367",
+    "catalog:piighost/international:5fd947ca",
+]
+
+[overlap_resolver]
+type = "merge"
+
+[expander]
+type = "word_boundary"
+
+[linker]
+type = "exact"
+
+[anonymizer.placeholder]
+type = "label_counter"
+
+[memory]
+type = "in_memory"
